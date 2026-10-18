@@ -1,0 +1,141 @@
+name: Compilar APK Biblia y apócrifos
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Poner el SDK de Android
+        # En el ordenador de Fredy no se descarga nada: todo pasa aqui, en la nube.
+        #
+        # ESTO ERA EL FALLO (del 4 al 7 de octubre, las siete ejecuciones):
+        # la primera descarga era la de WINDOWS. En Linux ese zip se baja igual de
+        # bien, asi que el "||" que ponia el de Linux no se usaba NUNCA. Se
+        # descomprimia el de Windows, y el unico comando que trae es "sdkmanager.bat",
+        # que en Linux no existe -> "sdkmanager: command not found". Como el comando
+        # iba con "| tail -3" y con "|| true", el paso decia "success" igual, y el
+        # fallo aparecia despues, en Gradle: "licences have not been accepted".
+        # Ahora solo se usa el zip de Linux, se usa el SDK del propio runner si ya
+        # esta, y ninguna linea oculta su codigo de salida.
+        run: |
+          set -euo pipefail
+          if [ -x /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager ]; then
+            SDK=/usr/local/lib/android/sdk
+            echo "Uso el SDK que ya trae la imagen del runner"
+          else
+            SDK="$HOME/android-sdk"
+            TOOLS="$SDK/cmdline-tools/latest"
+            mkdir -p "$SDK/cmdline-tools"
+            curl -sSL -o tools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            rm -rf "$TOOLS" "$SDK/cmdline-tools/cmdline-tools"
+            unzip -q tools.zip -d "$SDK/cmdline-tools"
+            mv "$SDK/cmdline-tools/cmdline-tools" "$TOOLS"
+            rm -f tools.zip
+            echo "Descargue las herramientas de Linux en $TOOLS"
+          fi
+          export ANDROID_HOME="$SDK"
+          export ANDROID_SDK_ROOT="$SDK"
+          echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
+          echo "$SDK/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          "$SM" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Comprobar el SDK (que falle aqui si algo falta)
+        run: |
+          set -euo pipefail
+          SM="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SM"
+          "$SM" --list_installed | grep -E "platforms;android-34|build-tools;34\.0\.0"
+          ls "$ANDROID_SDK_ROOT/licenses"
+
+      - name: Poner Gradle 8.7
+        run: |
+          set -euo pipefail
+          curl -sSL -o gradle.zip \
+            https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q gradle.zip
+          echo "$PWD/gradle-8.7/bin" >> $GITHUB_PATH
+          rm gradle.zip
+          gradle --version
+
+      - name: Cache de Gradle
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Generar keystore de firma
+        run: |
+          set -euo pipefail
+          keytool -genkeypair -v \
+            -keystore app/biblia.jks \
+            -storetype JKS \
+            -storepass biblia2026 -keypass biblia2026 \
+            -alias biblia -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Biblia, OU=Comunidad, O=Fredy, C=ES"
+          echo "keystore creado"
+
+      - name: Variables de firma
+        run: |
+          set -euo pipefail
+          echo "BIBLIA_KEYSTORE=${{ github.workspace }}/app/biblia.jks" >> $GITHUB_ENV
+          echo "BIBLIA_STORE_PASS=biblia2026" >> $GITHUB_ENV
+          echo "BIBLIA_KEY_ALIAS=biblia" >> $GITHUB_ENV
+          echo "BIBLIA_KEY_PASS=biblia2026" >> $GITHUB_ENV
+
+      - name: Compilar APK release
+        run: gradle assembleRelease --no-daemon
+
+      - name: Comprobar que el APK es de verdad un APK
+        # Antes nunca se llego a compilar, asi que este paso no existia. Ahora que
+        # se compila, mejor que lo diga el propio workflow: que el fichero este,
+        # que no este vacio y que por dentro tenga lo que tiene un APK.
+        run: |
+          set -euo pipefail
+          APK=$(ls app/build/outputs/apk/release/*.apk)
+          ls -l "$APK"
+          test -s "$APK"
+          unzip -l "$APK" | grep -q "AndroidManifest.xml"
+          unzip -l "$APK" | grep -q "classes.dex"
+          echo "APK correcto: $APK"
+
+      - name: Subir el APK como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: BibliaUnida
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Publicar en Releases para poder bajarlo desde el movil
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/*.apk
+          tag_name: v1.0-unida
+          name: Biblia y apócrifos 1.0
+          body: |
+            App de la Biblia Reina-Valera 1960 con los libros de fuera:
+            188 libros en total, para leer y escuchar.
+
+            Para instalarla en el movil:
+            1. Descarga el archivo .apk
+            2. Abre el archivo y Android pedira permiso para instalar apps
+               de origen desconocido: hay que activarlo una sola vez.
+            3. Toca "Instalar".

@@ -1,0 +1,11 @@
+name: Prueba
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  prueba:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "actions funciona"
